@@ -11,7 +11,7 @@ python -m pyxll install
 python -m pyxll configure
 
 pythonpath =
-	C:\Users\aluno.FTCBP\Downloads\DOOM-in-excel-main
+	C:\......\DOOM-in-excel-main
 
 modules =
 	doom
