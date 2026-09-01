@@ -1,0 +1,38 @@
+name: Build TrayDoom
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Baixar TrayDoom
+        uses: actions/checkout@v4
+        with:
+          repository: Trider12/traydoom
+          ref: master
+          path: traydoom
+
+      - name: Instalar MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Compilar TrayDoom
+        working-directory: traydoom
+        run: |
+          msbuild doomgeneric.sln /p:Configuration=Release /p:Platform=x64 /m
+
+      - name: Procurar executável
+        shell: pwsh
+        run: |
+          Get-ChildItem traydoom -Recurse -Filter "*.exe" |
+            Select-Object FullName
+
+      - name: Enviar executável
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrayDoom-x64
+          path: |
+            traydoom/**/*.exe
+          if-no-files-found: error
