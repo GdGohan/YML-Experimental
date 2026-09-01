@@ -4,6 +4,6 @@
 
 python -m pip install cydoomgeneric-0.1.0-cp312-cp312-win_amd64.whl
 
-pip install -r requirment.txt
+python -m pip install -r requirment.txt
 
-doom.py
+python -m pyxll install
