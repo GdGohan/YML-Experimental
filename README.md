@@ -7,3 +7,5 @@ python -m pip install cydoomgeneric-0.1.0-cp312-cp312-win_amd64.whl
 python -m pip install -r requirment.txt
 
 python -m pyxll install
+
+python -m pyxll configure
