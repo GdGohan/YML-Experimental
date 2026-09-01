@@ -1,0 +1,72 @@
+name: Build TrayDoom
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Baixar TrayDoom
+        uses: actions/checkout@v4
+        with:
+          repository: Trider12/traydoom
+          ref: master
+          path: traydoom
+
+      - name: Configurar MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Atualizar Platform Toolset
+        shell: pwsh
+        working-directory: traydoom
+        run: |
+          $project = "doomgeneric\doomgeneric.vcxproj"
+
+          Write-Host "Alterando v141 para v143..."
+          (Get-Content $project -Raw) `
+            -replace 'v141', 'v143' |
+            Set-Content $project -Encoding UTF8
+
+      - name: Compilar
+        shell: pwsh
+        working-directory: traydoom
+        run: |
+          msbuild doomgeneric.sln `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /m
+
+      - name: Procurar EXE
+        shell: pwsh
+        working-directory: traydoom
+        run: |
+          Write-Host "Executáveis encontrados:"
+          Get-ChildItem -Recurse -Filter "*.exe" |
+            Select-Object FullName
+
+      - name: Empacotar
+        shell: pwsh
+        working-directory: traydoom
+        run: |
+          $exe = Get-ChildItem -Recurse -Filter "*.exe" |
+            Where-Object { $_.Name -ne "vshost.exe" } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            Write-Error "Nenhum EXE encontrado."
+            exit 1
+          }
+
+          Write-Host "EXE encontrado: $($exe.FullName)"
+
+          New-Item -ItemType Directory -Force -Path output | Out-Null
+          Copy-Item $exe.FullName output\traydoom.exe
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrayDoom-Windows-x64
+          path: traydoom/output/traydoom.exe
+          if-no-files-found: error
