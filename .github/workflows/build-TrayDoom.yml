@@ -29,6 +29,39 @@ jobs:
             -replace 'v141', 'v143' |
             Set-Content $project -Encoding UTF8
 
+      - name: Corrigir ordem dos blocos da bandeja
+        shell: pwsh
+        working-directory: traydoom
+        run: |
+          $source = "doomgeneric\doomgeneric_win.c"
+
+          Write-Host "Aplicando correção de ordem em $source"
+
+          $content = Get-Content $source -Raw
+
+          $old = 'nid.uID = i * BLOCKS_ROW_SIZE + j;'
+
+          $new = @'
+          // Inverte horizontalmente a ordem dos blocos.
+          int trayId = i * BLOCKS_ROW_SIZE +
+                       (BLOCKS_ROW_SIZE - 1 - j);
+
+          nid.uID = trayId;
+          '@
+
+          if (-not $content.Contains($old)) {
+            Write-Error "Trecho esperado não encontrado em $source"
+            exit 1
+          }
+
+          $content = $content.Replace($old, $new.Trim())
+
+          Set-Content $source $content -Encoding UTF8
+
+          Write-Host "Correção aplicada com sucesso."
+          Write-Host "Novo mapeamento:"
+          Write-Host "DOOM [i,j] -> tray [i, 7-j]"
+
       - name: Compilar
         shell: pwsh
         working-directory: traydoom
