@@ -27,15 +27,11 @@ jobs:
           Write-Host "Atualizando Platform Toolset para v143..."
 
           $content = Get-Content $project -Raw
+          $content = $content -replace 'v141', 'v143'
 
-          if ($content -match 'v141') {
-            $content = $content -replace 'v141', 'v143'
-            Set-Content $project $content -Encoding UTF8
-            Write-Host "v141 -> v143 aplicado."
-          }
-          else {
-            Write-Host "v141 não encontrado. Nada para alterar."
-          }
+          Set-Content $project $content -Encoding UTF8
+
+          Write-Host "Platform Toolset atualizado."
 
       - name: Corrigir ordem dos blocos
         shell: pwsh
@@ -43,38 +39,30 @@ jobs:
         run: |
           $source = "doomgeneric\doomgeneric_win.c"
 
-          Write-Host "=========================================="
-          Write-Host "Corrigindo ordem dos blocos da bandeja"
-          Write-Host "Arquivo: $source"
-          Write-Host "=========================================="
+          Write-Host "Aplicando correção de ordem..."
 
           $content = Get-Content $source -Raw
 
           # ---------------------------------------------------------
-          # Primeiro garantimos que o código-fonte original não tenha
-          # uma alteração anterior de uID.
+          # IMPORTANTE:
           #
-          # Procuramos:
+          # NÃO alterar CreateIconIndirect().
+          # NÃO alterar a criação inicial dos ícones.
           #
-          # nid.uID = i * BLOCKS_ROW_SIZE + j;
-          #
-          # e substituímos pelo mapeamento reverso:
-          #
-          # 0 -> 63
-          # 1 -> 62
-          # ...
-          # 63 -> 0
+          # O problema será tratado somente no mapeamento entre
+          # bloco lógico do DOOM e uID do ícone.
           # ---------------------------------------------------------
 
           $old = 'nid.uID = i * BLOCKS_ROW_SIZE + j;'
 
           $new = @'
           int logicalId = i * BLOCKS_ROW_SIZE + j;
+
+          // Os ícones físicos estão em ordem reversa.
           nid.uID = (BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1) - logicalId;
           '@
 
           if ($content.Contains($old)) {
-            Write-Host "Encontrado mapeamento original."
 
             $content = $content.Replace(
               $old,
@@ -82,19 +70,23 @@ jobs:
             )
 
             Write-Host "Mapeamento reverso aplicado."
+
           }
           elseif (
             $content.Contains(
               'nid.uID = (BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1) - logicalId;'
             )
           ) {
-            Write-Host "Mapeamento reverso já está aplicado."
+
+            Write-Host "Mapeamento reverso já estava aplicado."
+
           }
           else {
-            Write-Error "Não foi possível encontrar o nid.uID esperado."
+
+            Write-Error "Linha nid.uID esperada não encontrada."
 
             Write-Host ""
-            Write-Host "Linhas contendo nid.uID:"
+            Write-Host "Linhas encontradas:"
 
             $lines = $content -split "`r?`n"
 
@@ -107,59 +99,34 @@ jobs:
             exit 1
           }
 
-          # ---------------------------------------------------------
-          # IMPORTANTE:
-          #
-          # Durante o NIM_ADD inicial, não usamos CreateIconIndirect.
-          # O comentário original do TrayDoom informa que isso pode
-          # inverter a ordem dos ícones.
-          #
-          # Portanto, se a linha estiver comentada, deixamos como está.
-          # Se alguma execução anterior a ativou, voltamos a comentar.
-          # ---------------------------------------------------------
-
-          $content = [regex]::Replace(
-            $content,
-            '(?m)^(\s*)nid\.hIcon\s*=\s*CreateIconIndirect\(&ii\);\s*$',
-            '$1//nid.hIcon = CreateIconIndirect(&ii);',
-            1
-          )
-
-          # ---------------------------------------------------------
-          # Não alterar o CreateIconIndirect usado em DG_DrawFrame().
-          #
-          # A substituição acima afeta somente a primeira ocorrência,
-          # que é a usada durante a inicialização dos ícones.
-          # ---------------------------------------------------------
-
           Set-Content $source $content -Encoding UTF8
 
-          Write-Host ""
-          Write-Host "Patch concluído."
+          Write-Host "Correção concluída."
 
-      - name: Verificar código corrigido
+      - name: Verificar código
         shell: pwsh
         working-directory: traydoom
         run: |
           $source = "doomgeneric\doomgeneric_win.c"
+
           $content = Get-Content $source -Raw
           $lines = $content -split "`r?`n"
 
           Write-Host ""
           Write-Host "=========================================="
-          Write-Host "VERIFICAÇÃO"
+          Write-Host "VERIFICAÇÃO DO CÓDIGO"
           Write-Host "=========================================="
 
-          Write-Host ""
-          Write-Host "Linhas relacionadas aos ícones:"
-
           for ($i = 0; $i -lt $lines.Count; $i++) {
+
             if (
               $lines[$i] -match "nid\.uID" -or
               $lines[$i] -match "CreateIconIndirect" -or
               $lines[$i] -match "Shell_NotifyIcon"
             ) {
+
               Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
+
             }
           }
 
@@ -171,22 +138,26 @@ jobs:
               'nid.uID = (BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1) - logicalId;'
             )
           ) {
+
             Write-Host "OK: mapeamento reverso encontrado."
+
           }
           else {
-            Write-Error "ERRO: mapeamento reverso não encontrado."
+
+            Write-Error "Mapeamento reverso não encontrado."
             exit 1
+
           }
 
           Write-Host ""
-          Write-Host "Verificação concluída."
+          Write-Host "CreateIconIndirect permanece inalterado."
 
       - name: Compilar
         shell: pwsh
         working-directory: traydoom
         run: |
           Write-Host "=========================================="
-          Write-Host "COMPILANDO TRAYDOOM"
+          Write-Host "COMPILANDO"
           Write-Host "=========================================="
 
           msbuild doomgeneric.sln `
@@ -200,7 +171,6 @@ jobs:
             exit $LASTEXITCODE
           }
 
-          Write-Host ""
           Write-Host "Compilação concluída."
 
       - name: Procurar EXE
@@ -208,7 +178,7 @@ jobs:
         working-directory: traydoom
         run: |
           Write-Host "=========================================="
-          Write-Host "EXECUTÁVEIS ENCONTRADOS"
+          Write-Host "EXECUTÁVEIS"
           Write-Host "=========================================="
 
           $executables = Get-ChildItem `
