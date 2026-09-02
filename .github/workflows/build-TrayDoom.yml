@@ -24,54 +24,77 @@ jobs:
         run: |
           $project = "doomgeneric\doomgeneric.vcxproj"
 
-          Write-Host "Alterando v141 para v143..."
+          Write-Host "Atualizando Platform Toolset para v143..."
 
           $content = Get-Content $project -Raw
+          $content = $content -replace 'v141', 'v143'
 
-          if (-not $content.Contains("v141")) {
-            Write-Host "v141 não encontrado. Nenhuma alteração necessária."
-          }
-          else {
-            $content = $content -replace 'v141', 'v143'
-            Set-Content $project $content -Encoding UTF8
-            Write-Host "Platform Toolset atualizado para v143."
-          }
+          Set-Content $project $content -Encoding UTF8
 
-      - name: Corrigir ordem dos ícones da bandeja
+          Write-Host "Platform Toolset atualizado."
+
+      - name: Corrigir ordem dos ícones
         shell: pwsh
         working-directory: traydoom
         run: |
           $source = "doomgeneric\doomgeneric_win.c"
 
-          Write-Host "Aplicando correção em $source"
+          Write-Host "Lendo $source..."
 
           $content = Get-Content $source -Raw
 
-          # Código original:
+          # Mostra onde estão os NIM_ADD antes da alteração.
+          Write-Host ""
+          Write-Host "=== NIM_ADD encontrados ==="
+
+          $matches = [regex]::Matches(
+            $content,
+            'Shell_NotifyIcon\s*\(\s*NIM_ADD\s*,\s*&nid\s*\)'
+          )
+
+          Write-Host "Quantidade encontrada: $($matches.Count)"
+
+          if ($matches.Count -eq 0) {
+            Write-Error "Nenhum Shell_NotifyIcon(NIM_ADD, &nid) encontrado."
+            exit 1
+          }
+
+          # Procura especificamente o loop que inicializa os 64 ícones.
+          #
+          # Original esperado:
           #
           # for (nid.uID = 0; nid.uID < BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE; nid.uID++)
-          # {
-          #     Shell_NotifyIcon(NIM_ADD, &nid);
-          # }
           #
-          # O Windows/Explorer pode apresentar os ícones em ordem
-          # inversa à ordem de inserção. Registramos 63 -> 0.
-          $old = @'
-          for (nid.uID = 0; nid.uID < BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE; nid.uID++)
-          {
+          # O regex aceita espaços e quebras de linha diferentes.
+          $pattern = '(?s)for\s*\(\s*nid\.uID\s*=\s*0\s*;\s*nid\.uID\s*<\s*BLOCKS_ROW_SIZE\s*\*\s*BLOCKS_ROW_SIZE\s*;\s*nid\.uID\s*\+\+\s*\)\s*\{.*?Shell_NotifyIcon\s*\(\s*NIM_ADD\s*,\s*&nid\s*\)\s*;\s*\}'
 
-          //nid.hIcon = CreateIconIndirect(&ii); // this usually reverses the order of icons
-          Shell_NotifyIcon(NIM_ADD, &nid);
+          $match = [regex]::Match($content, $pattern)
 
-          //DestroyIcon(nid.hIcon);
+          if (-not $match.Success) {
+            Write-Error "Loop original de inicialização dos ícones não foi encontrado."
 
+            Write-Host ""
+            Write-Host "Trechos contendo 'nid.uID':"
+
+            $lines = $content -split "`r?`n"
+
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match "nid\.uID") {
+                Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
+              }
+            }
+
+            exit 1
           }
-          '@
 
-          $new = @'
+          Write-Host ""
+          Write-Host "Loop encontrado na posição $($match.Index)."
+
+          $replacement = @'
           // Adiciona os ícones em ordem reversa.
-          // O Explorer pode posicionar os ícones em ordem inversa
-          // à ordem em que foram registrados.
+          //
+          // O Explorer pode posicionar os ícones da bandeja
+          // em ordem diferente da ordem de atualização.
           for (nid.uID = BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1;
                nid.uID >= 0;
                nid.uID--)
@@ -80,45 +103,49 @@ jobs:
           }
           '@
 
-          if (-not $content.Contains($old)) {
-            Write-Error "Bloco original de NIM_ADD não encontrado."
-            Write-Host "Trecho esperado não encontrado. Abortando para evitar alterar o código errado."
-            exit 1
-          }
-
-          $content = $content.Replace($old, $new.Trim())
+          $content = $content.Remove(
+            $match.Index,
+            $match.Length
+          ).Insert(
+            $match.Index,
+            $replacement.Trim()
+          )
 
           Set-Content $source $content -Encoding UTF8
 
-          Write-Host "Correção aplicada."
-          Write-Host "Ícones serão registrados na ordem: 63 -> 0"
-          Write-Host "O DG_DrawFrame continuará atualizando: 0 -> 63"
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Correção aplicada com sucesso."
+          Write-Host "Ícones registrados na ordem: 63 -> 0"
+          Write-Host "========================================"
 
-      - name: Verificar patch
+      - name: Verificar código corrigido
         shell: pwsh
         working-directory: traydoom
         run: |
           $source = "doomgeneric\doomgeneric_win.c"
           $content = Get-Content $source -Raw
 
-          Write-Host ""
-          Write-Host "=== Verificando ordem de inicialização ==="
+          Write-Host "Verificando código-fonte..."
 
-          if ($content.Contains("nid.uID = BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1")) {
+          if ($content -match 'nid\.uID\s*=\s*BLOCKS_ROW_SIZE\s*\*\s*BLOCKS_ROW_SIZE\s*-\s*1') {
             Write-Host "OK: loop reverso encontrado."
           }
           else {
-            Write-Error "Correção não encontrada no código-fonte."
+            Write-Error "Loop reverso não encontrado."
             exit 1
           }
 
           Write-Host ""
-          Write-Host "=== Trecho relacionado ==="
+          Write-Host "Linhas com nid.uID:"
 
-          Select-String `
-            -Path $source `
-            -Pattern "BLOCKS_ROW_SIZE \* BLOCKS_ROW_SIZE - 1|Shell_NotifyIcon\(NIM_ADD" `
-            -Context 2,2
+          $lines = $content -split "`r?`n"
+
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "nid\.uID") {
+              Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
+            }
+          }
 
       - name: Compilar
         shell: pwsh
@@ -137,7 +164,9 @@ jobs:
           Write-Host "Executáveis encontrados:"
 
           Get-ChildItem -Recurse -Filter "*.exe" |
-            Where-Object { $_.Name -ne "vshost.exe" } |
+            Where-Object {
+              $_.Name -ne "vshost.exe"
+            } |
             Select-Object FullName
 
       - name: Empacotar
@@ -147,20 +176,22 @@ jobs:
           $exe = Get-ChildItem -Recurse -Filter "*.exe" |
             Where-Object {
               $_.Name -ne "vshost.exe" -and
-              $_.FullName -notmatch '\\Debug\\' -and
-              $_.FullName -notmatch '\\Release\\.*test'
+              $_.FullName -match '\\Release\\'
             } |
             Select-Object -First 1
 
           if (-not $exe) {
-            Write-Error "Nenhum EXE encontrado."
+            Write-Error "Nenhum EXE de Release encontrado."
             exit 1
           }
 
           Write-Host "EXE encontrado:"
           Write-Host $exe.FullName
 
-          New-Item -ItemType Directory -Force -Path output | Out-Null
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path output | Out-Null
 
           Copy-Item `
             $exe.FullName `
@@ -168,7 +199,7 @@ jobs:
             -Force
 
           Write-Host ""
-          Write-Host "Pacote criado:"
+          Write-Host "Arquivo final:"
           Get-Item "output\traydoom.exe" |
             Select-Object FullName, Length
 
