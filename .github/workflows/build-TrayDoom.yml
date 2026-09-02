@@ -27,119 +27,221 @@ jobs:
           Write-Host "Atualizando Platform Toolset para v143..."
 
           $content = Get-Content $project -Raw
-          $content = $content -replace 'v141', 'v143'
 
-          Set-Content $project $content -Encoding UTF8
+          if ($content -match 'v141') {
+            $content = $content -replace 'v141', 'v143'
+            Set-Content $project $content -Encoding UTF8
+            Write-Host "v141 -> v143 aplicado."
+          }
+          else {
+            Write-Host "v141 não encontrado. Nada para alterar."
+          }
 
-          Write-Host "Platform Toolset atualizado."
-
-      - name: Corrigir imagem invertida
+      - name: Corrigir ordem dos blocos
         shell: pwsh
         working-directory: traydoom
         run: |
           $source = "doomgeneric\doomgeneric_win.c"
 
-          Write-Host "Corrigindo orientação horizontal dos blocos..."
+          Write-Host "=========================================="
+          Write-Host "Corrigindo ordem dos blocos da bandeja"
+          Write-Host "Arquivo: $source"
+          Write-Host "=========================================="
 
           $content = Get-Content $source -Raw
 
-          # Procura o acesso aos pixels dentro do bloco.
-          # A alteração espelha horizontalmente cada bloco.
+          # ---------------------------------------------------------
+          # Primeiro garantimos que o código-fonte original não tenha
+          # uma alteração anterior de uID.
           #
-          # IMPORTANTE:
-          # Não alteramos nid.uID.
-          # Não alteramos a ordem dos 64 ícones.
+          # Procuramos:
+          #
+          # nid.uID = i * BLOCKS_ROW_SIZE + j;
+          #
+          # e substituímos pelo mapeamento reverso:
+          #
+          # 0 -> 63
+          # 1 -> 62
+          # ...
+          # 63 -> 0
+          # ---------------------------------------------------------
 
-          $old = 'doomgeneric_getpixel(blockStart + y * DOOMGENERIC_RESX + x)'
+          $old = 'nid.uID = i * BLOCKS_ROW_SIZE + j;'
 
-          $new = 'doomgeneric_getpixel(blockStart + y * DOOMGENERIC_RESX + (BLOCK_SIZE - 1 - x))'
+          $new = @'
+          int logicalId = i * BLOCKS_ROW_SIZE + j;
+          nid.uID = (BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1) - logicalId;
+          '@
 
           if ($content.Contains($old)) {
-            $content = $content.Replace($old, $new)
+            Write-Host "Encontrado mapeamento original."
 
-            Set-Content $source $content -Encoding UTF8
+            $content = $content.Replace(
+              $old,
+              $new.TrimEnd()
+            )
 
-            Write-Host "Correção aplicada."
+            Write-Host "Mapeamento reverso aplicado."
+          }
+          elseif (
+            $content.Contains(
+              'nid.uID = (BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1) - logicalId;'
+            )
+          ) {
+            Write-Host "Mapeamento reverso já está aplicado."
           }
           else {
-            Write-Host "Padrão exato não encontrado."
+            Write-Error "Não foi possível encontrar o nid.uID esperado."
+
             Write-Host ""
-            Write-Host "Trechos relevantes do DG_DrawFrame():"
+            Write-Host "Linhas contendo nid.uID:"
 
-            $lines = Get-Content $source
-
-            $inside = $false
+            $lines = $content -split "`r?`n"
 
             for ($i = 0; $i -lt $lines.Count; $i++) {
-              if ($lines[$i] -match "DG_DrawFrame") {
-                $inside = $true
-              }
-
-              if ($inside) {
+              if ($lines[$i] -match "nid\.uID") {
                 Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
-              }
-
-              if ($inside -and $lines[$i] -match "^}") {
-                break
               }
             }
 
-            Write-Error "Não foi possível aplicar automaticamente."
             exit 1
           }
 
-      - name: Mostrar código corrigido
+          # ---------------------------------------------------------
+          # IMPORTANTE:
+          #
+          # Durante o NIM_ADD inicial, não usamos CreateIconIndirect.
+          # O comentário original do TrayDoom informa que isso pode
+          # inverter a ordem dos ícones.
+          #
+          # Portanto, se a linha estiver comentada, deixamos como está.
+          # Se alguma execução anterior a ativou, voltamos a comentar.
+          # ---------------------------------------------------------
+
+          $content = [regex]::Replace(
+            $content,
+            '(?m)^(\s*)nid\.hIcon\s*=\s*CreateIconIndirect\(&ii\);\s*$',
+            '$1//nid.hIcon = CreateIconIndirect(&ii);',
+            1
+          )
+
+          # ---------------------------------------------------------
+          # Não alterar o CreateIconIndirect usado em DG_DrawFrame().
+          #
+          # A substituição acima afeta somente a primeira ocorrência,
+          # que é a usada durante a inicialização dos ícones.
+          # ---------------------------------------------------------
+
+          Set-Content $source $content -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "Patch concluído."
+
+      - name: Verificar código corrigido
         shell: pwsh
         working-directory: traydoom
         run: |
           $source = "doomgeneric\doomgeneric_win.c"
+          $content = Get-Content $source -Raw
+          $lines = $content -split "`r?`n"
 
           Write-Host ""
-          Write-Host "=== Código relacionado aos ícones ==="
+          Write-Host "=========================================="
+          Write-Host "VERIFICAÇÃO"
+          Write-Host "=========================================="
 
-          $lines = Get-Content $source
+          Write-Host ""
+          Write-Host "Linhas relacionadas aos ícones:"
 
           for ($i = 0; $i -lt $lines.Count; $i++) {
             if (
+              $lines[$i] -match "nid\.uID" -or
               $lines[$i] -match "CreateIconIndirect" -or
-              $lines[$i] -match "Shell_NotifyIcon" -or
-              $lines[$i] -match "DestroyIcon"
+              $lines[$i] -match "Shell_NotifyIcon"
             ) {
               Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
             }
           }
 
+          Write-Host ""
+          Write-Host "Verificando mapeamento..."
+
+          if (
+            $content.Contains(
+              'nid.uID = (BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1) - logicalId;'
+            )
+          ) {
+            Write-Host "OK: mapeamento reverso encontrado."
+          }
+          else {
+            Write-Error "ERRO: mapeamento reverso não encontrado."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "Verificação concluída."
+
       - name: Compilar
         shell: pwsh
         working-directory: traydoom
         run: |
+          Write-Host "=========================================="
+          Write-Host "COMPILANDO TRAYDOOM"
+          Write-Host "=========================================="
+
           msbuild doomgeneric.sln `
             /p:Configuration=Release `
             /p:Platform=x64 `
             /m `
             /v:minimal
 
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "MSBuild falhou."
+            exit $LASTEXITCODE
+          }
+
+          Write-Host ""
+          Write-Host "Compilação concluída."
+
       - name: Procurar EXE
         shell: pwsh
         working-directory: traydoom
         run: |
-          Write-Host "Executáveis encontrados:"
+          Write-Host "=========================================="
+          Write-Host "EXECUTÁVEIS ENCONTRADOS"
+          Write-Host "=========================================="
 
-          Get-ChildItem -Recurse -Filter "*.exe" |
+          $executables = Get-ChildItem `
+            -Recurse `
+            -Filter "*.exe" |
             Where-Object {
               $_.Name -ne "vshost.exe"
-            } |
-            Select-Object FullName
+            }
+
+          if (-not $executables) {
+            Write-Error "Nenhum EXE encontrado."
+            exit 1
+          }
+
+          $executables |
+            Select-Object FullName, Length
 
       - name: Empacotar
         shell: pwsh
         working-directory: traydoom
         run: |
-          $exe = Get-ChildItem -Recurse -Filter "*.exe" |
+          Write-Host "=========================================="
+          Write-Host "EMPACOTANDO"
+          Write-Host "=========================================="
+
+          $exe = Get-ChildItem `
+            -Recurse `
+            -Filter "*.exe" |
             Where-Object {
               $_.Name -ne "vshost.exe" -and
               $_.FullName -match '\\Release\\'
             } |
+            Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
 
           if (-not $exe) {
@@ -147,21 +249,23 @@ jobs:
             exit 1
           }
 
-          Write-Host "EXE encontrado:"
+          Write-Host "EXE selecionado:"
           Write-Host $exe.FullName
 
           New-Item `
             -ItemType Directory `
             -Force `
-            -Path output | Out-Null
+            -Path output |
+            Out-Null
 
           Copy-Item `
-            $exe.FullName `
-            "output\traydoom.exe" `
+            -Path $exe.FullName `
+            -Destination "output\traydoom.exe" `
             -Force
 
           Write-Host ""
-          Write-Host "Arquivo final:"
+          Write-Host "Arquivo criado:"
+
           Get-Item "output\traydoom.exe" |
             Select-Object FullName, Length
 
