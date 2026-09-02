@@ -43,43 +43,28 @@ jobs:
 
           $content = Get-Content $source -Raw
 
-          # Mostra onde estão os NIM_ADD antes da alteração.
-          Write-Host ""
-          Write-Host "=== NIM_ADD encontrados ==="
-
-          $matches = [regex]::Matches(
-            $content,
-            'Shell_NotifyIcon\s*\(\s*NIM_ADD\s*,\s*&nid\s*\)'
-          )
-
-          Write-Host "Quantidade encontrada: $($matches.Count)"
-
-          if ($matches.Count -eq 0) {
-            Write-Error "Nenhum Shell_NotifyIcon(NIM_ADD, &nid) encontrado."
-            exit 1
-          }
-
-          # Procura especificamente o loop que inicializa os 64 ícones.
+          # O código original possui:
           #
-          # Original esperado:
+          # //nid.hIcon = CreateIconIndirect(&ii); // this usually reverses the order of icons
+          # Shell_NotifyIcon(NIM_ADD, &nid);
           #
-          # for (nid.uID = 0; nid.uID < BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE; nid.uID++)
-          #
-          # O regex aceita espaços e quebras de linha diferentes.
-          $pattern = '(?s)for\s*\(\s*nid\.uID\s*=\s*0\s*;\s*nid\.uID\s*<\s*BLOCKS_ROW_SIZE\s*\*\s*BLOCKS_ROW_SIZE\s*;\s*nid\.uID\s*\+\+\s*\)\s*\{.*?Shell_NotifyIcon\s*\(\s*NIM_ADD\s*,\s*&nid\s*\)\s*;\s*\}'
+          # Vamos ativar CreateIconIndirect durante a criação dos
+          # 64 ícones, pois o próprio autor indica que isso altera
+          # a ordem física apresentada pelo Explorer.
 
-          $match = [regex]::Match($content, $pattern)
+          $old = '//nid.hIcon = CreateIconIndirect(&ii); // this usually reverses the order of icons'
 
-          if (-not $match.Success) {
-            Write-Error "Loop original de inicialização dos ícones não foi encontrado."
+          $new = 'nid.hIcon = CreateIconIndirect(&ii);'
 
+          if (-not $content.Contains($old)) {
+            Write-Error "Linha esperada não encontrada."
             Write-Host ""
-            Write-Host "Trechos contendo 'nid.uID':"
-
+            Write-Host "Procurando referências a CreateIconIndirect:"
+            
             $lines = $content -split "`r?`n"
 
             for ($i = 0; $i -lt $lines.Count; $i++) {
-              if ($lines[$i] -match "nid\.uID") {
+              if ($lines[$i] -match "CreateIconIndirect") {
                 Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
               }
             }
@@ -87,62 +72,45 @@ jobs:
             exit 1
           }
 
-          Write-Host ""
-          Write-Host "Loop encontrado na posição $($match.Index)."
+          $content = $content.Replace($old, $new)
 
-          $replacement = @'
-          // Adiciona os ícones em ordem reversa.
-          //
-          // O Explorer pode posicionar os ícones da bandeja
-          // em ordem diferente da ordem de atualização.
-          for (nid.uID = BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1;
-               nid.uID >= 0;
-               nid.uID--)
-          {
-              Shell_NotifyIcon(NIM_ADD, &nid);
+          # Também ativa a destruição do HICON criado para evitar
+          # vazamento de recursos GDI.
+          $oldDestroy = '//DestroyIcon(nid.hIcon);'
+
+          if ($content.Contains($oldDestroy)) {
+            $content = $content.Replace(
+              $oldDestroy,
+              'DestroyIcon(nid.hIcon);'
+            )
           }
-          '@
-
-          $content = $content.Remove(
-            $match.Index,
-            $match.Length
-          ).Insert(
-            $match.Index,
-            $replacement.Trim()
-          )
 
           Set-Content $source $content -Encoding UTF8
 
           Write-Host ""
           Write-Host "========================================"
-          Write-Host "Correção aplicada com sucesso."
-          Write-Host "Ícones registrados na ordem: 63 -> 0"
+          Write-Host "Correção aplicada."
+          Write-Host "CreateIconIndirect: ATIVADO"
+          Write-Host "DestroyIcon: ATIVADO"
           Write-Host "========================================"
 
-      - name: Verificar código corrigido
+      - name: Mostrar código corrigido
         shell: pwsh
         working-directory: traydoom
         run: |
           $source = "doomgeneric\doomgeneric_win.c"
-          $content = Get-Content $source -Raw
-
-          Write-Host "Verificando código-fonte..."
-
-          if ($content -match 'nid\.uID\s*=\s*BLOCKS_ROW_SIZE\s*\*\s*BLOCKS_ROW_SIZE\s*-\s*1') {
-            Write-Host "OK: loop reverso encontrado."
-          }
-          else {
-            Write-Error "Loop reverso não encontrado."
-            exit 1
-          }
 
           Write-Host ""
-          Write-Host "Linhas com nid.uID:"
+          Write-Host "=== Código relacionado aos ícones ==="
 
-          $lines = $content -split "`r?`n"
+          $lines = Get-Content $source
 
           for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match "nid\.uID") {
+            if (
+              $lines[$i] -match "CreateIconIndirect" -or
+              $lines[$i] -match "Shell_NotifyIcon" -or
+              $lines[$i] -match "DestroyIcon"
+            ) {
               Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
             }
           }
