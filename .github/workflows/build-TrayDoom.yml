@@ -33,66 +33,60 @@ jobs:
 
           Write-Host "Platform Toolset atualizado."
 
-      - name: Corrigir ordem dos ícones
+      - name: Corrigir imagem invertida
         shell: pwsh
         working-directory: traydoom
         run: |
           $source = "doomgeneric\doomgeneric_win.c"
 
-          Write-Host "Lendo $source..."
+          Write-Host "Corrigindo orientação horizontal dos blocos..."
 
           $content = Get-Content $source -Raw
 
-          # O código original possui:
+          # Procura o acesso aos pixels dentro do bloco.
+          # A alteração espelha horizontalmente cada bloco.
           #
-          # //nid.hIcon = CreateIconIndirect(&ii); // this usually reverses the order of icons
-          # Shell_NotifyIcon(NIM_ADD, &nid);
-          #
-          # Vamos ativar CreateIconIndirect durante a criação dos
-          # 64 ícones, pois o próprio autor indica que isso altera
-          # a ordem física apresentada pelo Explorer.
+          # IMPORTANTE:
+          # Não alteramos nid.uID.
+          # Não alteramos a ordem dos 64 ícones.
 
-          $old = '//nid.hIcon = CreateIconIndirect(&ii); // this usually reverses the order of icons'
+          $old = 'doomgeneric_getpixel(blockStart + y * DOOMGENERIC_RESX + x)'
 
-          $new = 'nid.hIcon = CreateIconIndirect(&ii);'
+          $new = 'doomgeneric_getpixel(blockStart + y * DOOMGENERIC_RESX + (BLOCK_SIZE - 1 - x))'
 
-          if (-not $content.Contains($old)) {
-            Write-Error "Linha esperada não encontrada."
+          if ($content.Contains($old)) {
+            $content = $content.Replace($old, $new)
+
+            Set-Content $source $content -Encoding UTF8
+
+            Write-Host "Correção aplicada."
+          }
+          else {
+            Write-Host "Padrão exato não encontrado."
             Write-Host ""
-            Write-Host "Procurando referências a CreateIconIndirect:"
-            
-            $lines = $content -split "`r?`n"
+            Write-Host "Trechos relevantes do DG_DrawFrame():"
+
+            $lines = Get-Content $source
+
+            $inside = $false
 
             for ($i = 0; $i -lt $lines.Count; $i++) {
-              if ($lines[$i] -match "CreateIconIndirect") {
+              if ($lines[$i] -match "DG_DrawFrame") {
+                $inside = $true
+              }
+
+              if ($inside) {
                 Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
+              }
+
+              if ($inside -and $lines[$i] -match "^}") {
+                break
               }
             }
 
+            Write-Error "Não foi possível aplicar automaticamente."
             exit 1
           }
-
-          $content = $content.Replace($old, $new)
-
-          # Também ativa a destruição do HICON criado para evitar
-          # vazamento de recursos GDI.
-          $oldDestroy = '//DestroyIcon(nid.hIcon);'
-
-          if ($content.Contains($oldDestroy)) {
-            $content = $content.Replace(
-              $oldDestroy,
-              'DestroyIcon(nid.hIcon);'
-            )
-          }
-
-          Set-Content $source $content -Encoding UTF8
-
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "Correção aplicada."
-          Write-Host "CreateIconIndirect: ATIVADO"
-          Write-Host "DestroyIcon: ATIVADO"
-          Write-Host "========================================"
 
       - name: Mostrar código corrigido
         shell: pwsh
