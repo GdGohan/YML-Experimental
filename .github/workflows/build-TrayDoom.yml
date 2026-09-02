@@ -25,32 +25,64 @@ jobs:
           $project = "doomgeneric\doomgeneric.vcxproj"
 
           Write-Host "Alterando v141 para v143..."
-          (Get-Content $project -Raw) `
-            -replace 'v141', 'v143' |
-            Set-Content $project -Encoding UTF8
 
-      - name: Corrigir ordem dos blocos da bandeja
+          $content = Get-Content $project -Raw
+
+          if (-not $content.Contains("v141")) {
+            Write-Host "v141 não encontrado. Nenhuma alteração necessária."
+          }
+          else {
+            $content = $content -replace 'v141', 'v143'
+            Set-Content $project $content -Encoding UTF8
+            Write-Host "Platform Toolset atualizado para v143."
+          }
+
+      - name: Corrigir ordem dos ícones da bandeja
         shell: pwsh
         working-directory: traydoom
         run: |
           $source = "doomgeneric\doomgeneric_win.c"
 
-          Write-Host "Aplicando correção de ordem em $source"
+          Write-Host "Aplicando correção em $source"
 
           $content = Get-Content $source -Raw
 
-          $old = 'nid.uID = i * BLOCKS_ROW_SIZE + j;'
+          # Código original:
+          #
+          # for (nid.uID = 0; nid.uID < BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE; nid.uID++)
+          # {
+          #     Shell_NotifyIcon(NIM_ADD, &nid);
+          # }
+          #
+          # O Windows/Explorer pode apresentar os ícones em ordem
+          # inversa à ordem de inserção. Registramos 63 -> 0.
+          $old = @'
+          for (nid.uID = 0; nid.uID < BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE; nid.uID++)
+          {
+
+          //nid.hIcon = CreateIconIndirect(&ii); // this usually reverses the order of icons
+          Shell_NotifyIcon(NIM_ADD, &nid);
+
+          //DestroyIcon(nid.hIcon);
+
+          }
+          '@
 
           $new = @'
-          // Inverte horizontalmente a ordem dos blocos.
-          int trayId = i * BLOCKS_ROW_SIZE +
-                       (BLOCKS_ROW_SIZE - 1 - j);
-
-          nid.uID = trayId;
+          // Adiciona os ícones em ordem reversa.
+          // O Explorer pode posicionar os ícones em ordem inversa
+          // à ordem em que foram registrados.
+          for (nid.uID = BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1;
+               nid.uID >= 0;
+               nid.uID--)
+          {
+              Shell_NotifyIcon(NIM_ADD, &nid);
+          }
           '@
 
           if (-not $content.Contains($old)) {
-            Write-Error "Trecho esperado não encontrado em $source"
+            Write-Error "Bloco original de NIM_ADD não encontrado."
+            Write-Host "Trecho esperado não encontrado. Abortando para evitar alterar o código errado."
             exit 1
           }
 
@@ -58,9 +90,35 @@ jobs:
 
           Set-Content $source $content -Encoding UTF8
 
-          Write-Host "Correção aplicada com sucesso."
-          Write-Host "Novo mapeamento:"
-          Write-Host "DOOM [i,j] -> tray [i, 7-j]"
+          Write-Host "Correção aplicada."
+          Write-Host "Ícones serão registrados na ordem: 63 -> 0"
+          Write-Host "O DG_DrawFrame continuará atualizando: 0 -> 63"
+
+      - name: Verificar patch
+        shell: pwsh
+        working-directory: traydoom
+        run: |
+          $source = "doomgeneric\doomgeneric_win.c"
+          $content = Get-Content $source -Raw
+
+          Write-Host ""
+          Write-Host "=== Verificando ordem de inicialização ==="
+
+          if ($content.Contains("nid.uID = BLOCKS_ROW_SIZE * BLOCKS_ROW_SIZE - 1")) {
+            Write-Host "OK: loop reverso encontrado."
+          }
+          else {
+            Write-Error "Correção não encontrada no código-fonte."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "=== Trecho relacionado ==="
+
+          Select-String `
+            -Path $source `
+            -Pattern "BLOCKS_ROW_SIZE \* BLOCKS_ROW_SIZE - 1|Shell_NotifyIcon\(NIM_ADD" `
+            -Context 2,2
 
       - name: Compilar
         shell: pwsh
@@ -69,14 +127,17 @@ jobs:
           msbuild doomgeneric.sln `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /m
+            /m `
+            /v:minimal
 
       - name: Procurar EXE
         shell: pwsh
         working-directory: traydoom
         run: |
           Write-Host "Executáveis encontrados:"
+
           Get-ChildItem -Recurse -Filter "*.exe" |
+            Where-Object { $_.Name -ne "vshost.exe" } |
             Select-Object FullName
 
       - name: Empacotar
@@ -84,7 +145,11 @@ jobs:
         working-directory: traydoom
         run: |
           $exe = Get-ChildItem -Recurse -Filter "*.exe" |
-            Where-Object { $_.Name -ne "vshost.exe" } |
+            Where-Object {
+              $_.Name -ne "vshost.exe" -and
+              $_.FullName -notmatch '\\Debug\\' -and
+              $_.FullName -notmatch '\\Release\\.*test'
+            } |
             Select-Object -First 1
 
           if (-not $exe) {
@@ -92,10 +157,20 @@ jobs:
             exit 1
           }
 
-          Write-Host "EXE encontrado: $($exe.FullName)"
+          Write-Host "EXE encontrado:"
+          Write-Host $exe.FullName
 
           New-Item -ItemType Directory -Force -Path output | Out-Null
-          Copy-Item $exe.FullName output\traydoom.exe
+
+          Copy-Item `
+            $exe.FullName `
+            "output\traydoom.exe" `
+            -Force
+
+          Write-Host ""
+          Write-Host "Pacote criado:"
+          Get-Item "output\traydoom.exe" |
+            Select-Object FullName, Length
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
