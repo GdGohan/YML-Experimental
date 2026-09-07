@@ -41,11 +41,42 @@ jobs:
           sudo chown $USER ${{ env.CEGCC_PREFIX }}
           wget -O /tmp/mingw32ce.tar.bz2 \
             "https://sourceforge.net/projects/cegcc/files/cegcc/0.59.1/mingw32ce-0.59.1.tar.bz2/download"
-          tar xjf /tmp/mingw32ce.tar.bz2 -C ${{ env.CEGCC_PREFIX }} --strip-components=1
-          echo "${{ env.CEGCC_PREFIX }}/bin" >> "$GITHUB_PATH"
+          # NÃO usar --strip-components aqui: esses toolchains antigos do
+          # cegcc têm caminhos relativos fixos entre bin/ e o sysroot
+          # (algo como bin/../arm-mingw32ce/include), então extrair
+          # preservando a estrutura original do tarball é o que importa,
+          # não o nome da pasta em si.
+          tar xjf /tmp/mingw32ce.tar.bz2 -C ${{ env.CEGCC_PREFIX }}
+          find ${{ env.CEGCC_PREFIX }} -maxdepth 4 -type d
 
-      - name: Adicionar toolchain ao PATH (quando veio do cache)
-        run: echo "${{ env.CEGCC_PREFIX }}/bin" >> "$GITHUB_PATH"
+      - name: Descobrir caminhos reais da toolchain (bin, sysroot, windows.h)
+        id: toolchain-paths
+        run: |
+          set -e
+          GCC_BIN=$(find ${{ env.CEGCC_PREFIX }} -name 'arm-mingw32ce-gcc*' -type f | head -1)
+          if [ -z "$GCC_BIN" ]; then
+            echo "Não achei arm-mingw32ce-gcc dentro do tarball extraído - a estrutura do pacote mudou, precisa inspecionar manualmente." >&2
+            exit 1
+          fi
+          BIN_DIR=$(dirname "$GCC_BIN")
+          echo "$BIN_DIR" >> "$GITHUB_PATH"
+
+          WIN_H=$(find ${{ env.CEGCC_PREFIX }} -iname 'windows.h' | head -1)
+          if [ -z "$WIN_H" ]; then
+            echo "windows.h não existe em lugar nenhum do tarball - esse pacote 0.59.1 pode estar incompleto/corrompido, ou o SDK real precisa ser baixado à parte. Considere usar os scripts cross-configure-mingw32ce.sh / cross-make-mingw32ce.sh que costumam vir junto, em vez de chamar ./configure direto." >&2
+            exit 1
+          fi
+          INCLUDE_DIR=$(dirname "$WIN_H")
+          echo "include_dir=$INCLUDE_DIR" >> "$GITHUB_OUTPUT"
+
+          LIB_DIR=$(find ${{ env.CEGCC_PREFIX }} -name 'libcoredll*' | head -1 | xargs dirname)
+          echo "lib_dir=$LIB_DIR" >> "$GITHUB_OUTPUT"
+
+          echo "gcc encontrado em: $BIN_DIR"
+          echo "windows.h encontrado em: $INCLUDE_DIR"
+          echo "libcoredll encontrado em: $LIB_DIR"
+
+
 
       # SDL 1.2, SDL_mixer 1.2 e SDL_net 1.2 têm suporte nativo a WinCE via
       # autoconf (--host=arm-mingw32ce) nas versões ~1.2.13-1.2.15, antes de
@@ -53,10 +84,12 @@ jobs:
       # os três pra um sysroot comum antes de compilar o jogo.
       - name: Cross-compilar SDL 1.2 / SDL_mixer / SDL_net p/ WinCE ARM
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        env:
+          CPPFLAGS: -I${{ steps.toolchain-paths.outputs.include_dir }}
+          LDFLAGS: -L${{ steps.toolchain-paths.outputs.lib_dir }}
         run: |
           set -e
           mkdir -p ${{ env.SYSROOT }}
-          export PATH="${{ env.CEGCC_PREFIX }}/bin:$PATH"
 
           git clone --depth 1 --branch release-1.2.15 \
             https://github.com/libsdl-org/SDL-1.2.git /tmp/SDL-1.2
@@ -101,10 +134,9 @@ jobs:
         working-directory: chocolate-doom
         env:
           SDL_CONFIG: ${{ env.SYSROOT }}/bin/sdl-config
-          CPPFLAGS: -I${{ env.SYSROOT }}/include
-          LDFLAGS: -L${{ env.SYSROOT }}/lib
+          CPPFLAGS: -I${{ env.SYSROOT }}/include -I${{ steps.toolchain-paths.outputs.include_dir }}
+          LDFLAGS: -L${{ env.SYSROOT }}/lib -L${{ steps.toolchain-paths.outputs.lib_dir }}
         run: |
-          export PATH="${{ env.CEGCC_PREFIX }}/bin:$PATH"
           ./autogen.sh
           ./configure \
             --host=${{ env.HOST_TRIPLE }} \
@@ -113,9 +145,7 @@ jobs:
 
       - name: Compilar
         working-directory: chocolate-doom
-        run: |
-          export PATH="${{ env.CEGCC_PREFIX }}/bin:$PATH"
-          make -j"$(nproc)"
+        run: make -j"$(nproc)"
 
       - name: Upload dos binários .exe (ARM WinCE)
         uses: actions/upload-artifact@v4
