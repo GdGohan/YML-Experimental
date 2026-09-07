@@ -1,0 +1,133 @@
+name: Build Chocolate Doom (WinCE ARM) - MediaNav Evolution 5.2.7
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ wince-medianav ]
+
+env:
+  CEGCC_PREFIX: /opt/mingw32ce
+  HOST_TRIPLE: arm-mingw32ce
+  SYSROOT: /opt/wince-sysroot
+
+jobs:
+  build-wince-arm:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout do repo (contém o .patch de touch controls)
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Cache toolchain + libs cruzadas (SDL 1.2/mixer/net)
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CEGCC_PREFIX }}
+            ${{ env.SYSROOT }}
+          key: wince-toolchain-sdl12-${{ runner.os }}-v1
+
+      # Toolchain pré-compilada do projeto cegcc (0.59.1), a mesma usada
+      # historicamente por Navit e outros projetos WinCE/ARM. É a rota mais
+      # confiável hoje em dia porque buildar o cegcc do zero está com script
+      # quebrado em compiladores atuais (ver enlyze/cegcc-build se quiser
+      # tentar uma versão mais nova baseada em gcc 9.3).
+      - name: Baixar e instalar toolchain arm-mingw32ce (cegcc 0.59.1)
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          sudo mkdir -p ${{ env.CEGCC_PREFIX }}
+          sudo chown $USER ${{ env.CEGCC_PREFIX }}
+          wget -O /tmp/mingw32ce.tar.bz2 \
+            "https://sourceforge.net/projects/cegcc/files/cegcc/0.59.1/mingw32ce-0.59.1.tar.bz2/download"
+          tar xjf /tmp/mingw32ce.tar.bz2 -C ${{ env.CEGCC_PREFIX }} --strip-components=1
+          echo "${{ env.CEGCC_PREFIX }}/bin" >> "$GITHUB_PATH"
+
+      - name: Adicionar toolchain ao PATH (quando veio do cache)
+        run: echo "${{ env.CEGCC_PREFIX }}/bin" >> "$GITHUB_PATH"
+
+      # SDL 1.2, SDL_mixer 1.2 e SDL_net 1.2 têm suporte nativo a WinCE via
+      # autoconf (--host=arm-mingw32ce) nas versões ~1.2.13-1.2.15, antes de
+      # o suporte a WinCE ser removido do configure.in do SDL. Cross-compilamos
+      # os três pra um sysroot comum antes de compilar o jogo.
+      - name: Cross-compilar SDL 1.2 / SDL_mixer / SDL_net p/ WinCE ARM
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          mkdir -p ${{ env.SYSROOT }}
+          export PATH="${{ env.CEGCC_PREFIX }}/bin:$PATH"
+
+          git clone --depth 1 --branch release-1.2.15 \
+            https://github.com/libsdl-org/SDL-1.2.git /tmp/SDL-1.2
+          cd /tmp/SDL-1.2
+          ./autogen.sh
+          ./configure --host=${{ env.HOST_TRIPLE }} --prefix=${{ env.SYSROOT }} \
+            --disable-video-x11 --enable-video-wince
+          make -j"$(nproc)"
+          make install
+
+          git clone --depth 1 --branch release-1.2.12 \
+            https://github.com/libsdl-org/SDL_mixer.git /tmp/SDL_mixer
+          cd /tmp/SDL_mixer
+          ./autogen.sh
+          ./configure --host=${{ env.HOST_TRIPLE }} --prefix=${{ env.SYSROOT }} \
+            --with-sdl-prefix=${{ env.SYSROOT }} --disable-music-mp3 --disable-music-ogg
+          make -j"$(nproc)"
+          make install
+
+          git clone --depth 1 --branch release-1.2.8 \
+            https://github.com/libsdl-org/SDL_net.git /tmp/SDL_net
+          cd /tmp/SDL_net
+          ./autogen.sh
+          ./configure --host=${{ env.HOST_TRIPLE }} --prefix=${{ env.SYSROOT }} \
+            --with-sdl-prefix=${{ env.SYSROOT }}
+          make -j"$(nproc)"
+          make install
+
+      - name: Checkout Chocolate Doom 1.3.0
+        uses: actions/checkout@v4
+        with:
+          repository: chocolate-doom/chocolate-doom
+          ref: chocolate-doom-1.3.0
+          path: chocolate-doom
+
+      - name: Aplicar patch de touch controls
+        run: |
+          cd chocolate-doom
+          git apply ../repo/touch-controls-medianav.patch
+
+      - name: Configurar (cross-build autotools p/ WinCE ARM)
+        working-directory: chocolate-doom
+        env:
+          SDL_CONFIG: ${{ env.SYSROOT }}/bin/sdl-config
+          CPPFLAGS: -I${{ env.SYSROOT }}/include
+          LDFLAGS: -L${{ env.SYSROOT }}/lib
+        run: |
+          export PATH="${{ env.CEGCC_PREFIX }}/bin:$PATH"
+          ./autogen.sh
+          ./configure \
+            --host=${{ env.HOST_TRIPLE }} \
+            --prefix=/dist \
+            --disable-sdltest --disable-sdlmixertest --disable-sdlnettest
+
+      - name: Compilar
+        working-directory: chocolate-doom
+        run: |
+          export PATH="${{ env.CEGCC_PREFIX }}/bin:$PATH"
+          make -j"$(nproc)"
+
+      - name: Upload dos binários .exe (ARM WinCE)
+        uses: actions/upload-artifact@v4
+        with:
+          name: chocolate-doom-medianav-arm
+          path: |
+            chocolate-doom/src/*.exe
+            ${{ env.SYSROOT }}/bin/*.dll
+          if-no-files-found: warn
+
+  # Empacotamento em .cab: as ferramentas oficiais da Microsoft (cabwiz)
+  # só rodam no Windows. Pra instalar no MediaNav, o caminho mais simples
+  # é pegar os artifacts (.exe + .dll da SDL) e copiar via USB/cartão pra
+  # dentro do WinCE, tipo o README do Morkin23/doom-arm-ce mostra - sem
+  # precisar de instalador de verdade.
