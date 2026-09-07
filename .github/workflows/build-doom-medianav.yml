@@ -8,7 +8,14 @@ on:
 env:
   CEGCC_PREFIX: /opt/mingw32ce
   HOST_TRIPLE: arm-mingw32ce
-  SYSROOT: /opt/wince-sysroot
+  # DLLs pré-compiladas de dentro do chocolate-doom-1.3.0-wince.cab original
+  # (a mesma build ARM WinCE que o Morkin23/doom-arm-ce redistribui). Como
+  # não existe receita oficial pra cross-compilar SDL_mixer/SDL_net pra WinCE
+  # (só o SDL "puro" tem projeto VisualCE de referência - SDL_mixer e SDL_net
+  # nunca tiveram), a rota realista é reaproveitar essas DLLs já compiladas
+  # e gerar libs de importação (.a) pra linkar contra elas, em vez de tentar
+  # recompilar SDL/mixer/net do zero.
+  CAB_URL: https://github.com/Morkin23/doom-arm-ce/raw/main/chocolate-doom-1.3.0-wince.cab
 
 jobs:
   build-wince-arm:
@@ -19,104 +26,121 @@ jobs:
         with:
           path: repo
 
-      - name: Cache toolchain + libs cruzadas (SDL 1.2/mixer/net)
+      - name: Cache toolchain
         id: cache-toolchain
         uses: actions/cache@v4
         with:
-          path: |
-            ${{ env.CEGCC_PREFIX }}
-            ${{ env.SYSROOT }}
-          key: wince-toolchain-sdl12-${{ runner.os }}-v1
+          path: ${{ env.CEGCC_PREFIX }}
+          key: wince-toolchain-${{ runner.os }}-v2
 
       # Toolchain pré-compilada do projeto cegcc (0.59.1), a mesma usada
-      # historicamente por Navit e outros projetos WinCE/ARM. É a rota mais
-      # confiável hoje em dia porque buildar o cegcc do zero está com script
-      # quebrado em compiladores atuais (ver enlyze/cegcc-build se quiser
-      # tentar uma versão mais nova baseada em gcc 9.3).
+      # historicamente por Navit e outros projetos WinCE/ARM.
       - name: Baixar e instalar toolchain arm-mingw32ce (cegcc 0.59.1)
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
         run: |
           set -e
           sudo mkdir -p ${{ env.CEGCC_PREFIX }}
-          sudo chown $USER ${{ env.CEGCC_PREFIX }}
+          sudo chown "$USER" ${{ env.CEGCC_PREFIX }}
           wget -O /tmp/mingw32ce.tar.bz2 \
             "https://sourceforge.net/projects/cegcc/files/cegcc/0.59.1/mingw32ce-0.59.1.tar.bz2/download"
-          # NÃO usar --strip-components aqui: esses toolchains antigos do
-          # cegcc têm caminhos relativos fixos entre bin/ e o sysroot
-          # (algo como bin/../arm-mingw32ce/include), então extrair
-          # preservando a estrutura original do tarball é o que importa,
-          # não o nome da pasta em si.
+          # NÃO usar --strip-components: esse toolchain tem caminhos
+          # relativos fixos entre bin/ e o sysroot interno.
           tar xjf /tmp/mingw32ce.tar.bz2 -C ${{ env.CEGCC_PREFIX }}
           find ${{ env.CEGCC_PREFIX }} -maxdepth 4 -type d
 
-      - name: Descobrir caminhos reais da toolchain (bin, sysroot, windows.h)
-        id: toolchain-paths
+      - name: Descobrir caminhos reais da toolchain
+        id: tc
         run: |
           set -e
           GCC_BIN=$(find ${{ env.CEGCC_PREFIX }} -name 'arm-mingw32ce-gcc*' -type f | head -1)
-          if [ -z "$GCC_BIN" ]; then
-            echo "Não achei arm-mingw32ce-gcc dentro do tarball extraído - a estrutura do pacote mudou, precisa inspecionar manualmente." >&2
-            exit 1
-          fi
+          [ -n "$GCC_BIN" ] || { echo "arm-mingw32ce-gcc não encontrado no tarball extraído."  >&2; exit 1; }
           BIN_DIR=$(dirname "$GCC_BIN")
           echo "$BIN_DIR" >> "$GITHUB_PATH"
+          echo "bin_dir=$BIN_DIR" >> "$GITHUB_OUTPUT"
 
           WIN_H=$(find ${{ env.CEGCC_PREFIX }} -iname 'windows.h' | head -1)
-          if [ -z "$WIN_H" ]; then
-            echo "windows.h não existe em lugar nenhum do tarball - esse pacote 0.59.1 pode estar incompleto/corrompido, ou o SDK real precisa ser baixado à parte. Considere usar os scripts cross-configure-mingw32ce.sh / cross-make-mingw32ce.sh que costumam vir junto, em vez de chamar ./configure direto." >&2
-            exit 1
-          fi
-          INCLUDE_DIR=$(dirname "$WIN_H")
-          echo "include_dir=$INCLUDE_DIR" >> "$GITHUB_OUTPUT"
+          [ -n "$WIN_H" ] || { echo "windows.h não existe no tarball - pacote incompleto/corrompido." >&2; exit 1; }
+          echo "include_dir=$(dirname "$WIN_H")" >> "$GITHUB_OUTPUT"
 
           LIB_DIR=$(find ${{ env.CEGCC_PREFIX }} -name 'libcoredll*' | head -1 | xargs dirname)
           echo "lib_dir=$LIB_DIR" >> "$GITHUB_OUTPUT"
 
-          echo "gcc encontrado em: $BIN_DIR"
-          echo "windows.h encontrado em: $INCLUDE_DIR"
-          echo "libcoredll encontrado em: $LIB_DIR"
+          echo "gcc: $BIN_DIR | include: $(dirname "$WIN_H") | libs: $LIB_DIR"
 
+      - name: Instalar cabextract (pra abrir o .cab original)
+        run: sudo apt-get update && sudo apt-get install -y cabextract
 
-
-      # SDL 1.2, SDL_mixer 1.2 e SDL_net 1.2 têm suporte nativo a WinCE via
-      # autoconf (--host=arm-mingw32ce) nas versões ~1.2.13-1.2.15, antes de
-      # o suporte a WinCE ser removido do configure.in do SDL. Cross-compilamos
-      # os três pra um sysroot comum antes de compilar o jogo.
-      - name: Cross-compilar SDL 1.2 / SDL_mixer / SDL_net p/ WinCE ARM
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
-        env:
-          CPPFLAGS: -I${{ steps.toolchain-paths.outputs.include_dir }}
-          LDFLAGS: -L${{ steps.toolchain-paths.outputs.lib_dir }}
+      - name: Baixar e extrair o chocolate-doom-1.3.0-wince.cab
         run: |
           set -e
-          mkdir -p ${{ env.SYSROOT }}
+          mkdir -p /tmp/cab-extracted
+          wget -O /tmp/chocolate-doom-wince.cab "${{ env.CAB_URL }}"
+          cabextract -d /tmp/cab-extracted /tmp/chocolate-doom-wince.cab
+          ls -la /tmp/cab-extracted
+          # Renomeia conforme o mapeamento documentado no próprio README do
+          # Morkin23/doom-arm-ce (os nomes saem truncados/cifrados do cab).
+          cd /tmp/cab-extracted
+          mv -v SDLmixer.005  SDL_mixer.dll
+          mv -v 00000SDL.002  SDL.dll
+          mv -v libSDLne.001  libSDL_net-1-2-0.dll
 
-          git clone --depth 1 --branch release-1.2.15 \
-            https://github.com/libsdl-org/SDL-1.2.git /tmp/SDL-1.2
-          cd /tmp/SDL-1.2
-          ./autogen.sh
-          ./configure --host=${{ env.HOST_TRIPLE }} --prefix=${{ env.SYSROOT }} \
-            --disable-video-x11 --enable-video-wince
-          make -j"$(nproc)"
-          make install
+      - name: Gerar libs de importação (.a) a partir das DLLs originais
+        id: implibs
+        run: |
+          set -e
+          mkdir -p /tmp/implibs
+          cd /tmp/implibs
 
-          git clone --depth 1 --branch release-1.2.12 \
-            https://github.com/libsdl-org/SDL_mixer.git /tmp/SDL_mixer
-          cd /tmp/SDL_mixer
-          ./autogen.sh
-          ./configure --host=${{ env.HOST_TRIPLE }} --prefix=${{ env.SYSROOT }} \
-            --with-sdl-prefix=${{ env.SYSROOT }} --disable-music-mp3 --disable-music-ogg
-          make -j"$(nproc)"
-          make install
+          gen_implib() {
+            local dll="$1" libname="$2"
+            cp "/tmp/cab-extracted/$dll" .
+            # Lista os símbolos exportados da DLL original direto da
+            # export table do PE (arm-mingw32ce-objdump entende PE ARM
+            # porque foi construído pra esse target). O formato exato da
+            # saída do objdump pode variar por versão - se o awk abaixo
+            # não achar nada, rode `arm-mingw32ce-objdump -p "$dll"` manualmente
+            # pra ver o formato real e ajustar o parser.
+            arm-mingw32ce-objdump -p "$dll" > "${dll}.objdump.txt"
+            {
+              echo "LIBRARY $dll"
+              echo "EXPORTS"
+              awk '/Ordinal\/Name Pointer Table/{flag=1; next} /^\s*$/{flag=0} flag' "${dll}.objdump.txt" \
+                | grep -oE '\]\s*\S+' | sed 's/\]\s*//'
+            } > "${dll}.def"
 
-          git clone --depth 1 --branch release-1.2.8 \
-            https://github.com/libsdl-org/SDL_net.git /tmp/SDL_net
-          cd /tmp/SDL_net
-          ./autogen.sh
-          ./configure --host=${{ env.HOST_TRIPLE }} --prefix=${{ env.SYSROOT }} \
-            --with-sdl-prefix=${{ env.SYSROOT }}
-          make -j"$(nproc)"
-          make install
+            if [ "$(grep -c . "${dll}.def")" -le 2 ]; then
+              echo "AVISO: não consegui extrair símbolos de $dll automaticamente." >&2
+              echo "Rode 'arm-mingw32ce-objdump -p $dll' manualmente e monte o .def à mão." >&2
+              exit 1
+            fi
+
+            arm-mingw32ce-dlltool --dllname "$dll" --def "${dll}.def" --output-lib "lib${libname}.a"
+          }
+
+          gen_implib SDL.dll SDL
+          gen_implib SDL_mixer.dll SDL_mixer
+          gen_implib libSDL_net-1-2-0.dll SDL_net
+
+          echo "implib_dir=/tmp/implibs" >> "$GITHUB_OUTPUT"
+          ls -la /tmp/implibs
+
+      # Headers do SDL 1.2 são só declarações - servem pra qualquer alvo,
+      # só precisam do SDL_config.h certo (o mesmo usado pela build oficial
+      # de referência pra Windows/WinCE, que já trata _WIN32_WCE
+      # internamente, confirmado no include/SDL_config_win32.h do fonte).
+      - name: Preparar headers do SDL 1.2/mixer/net
+        run: |
+          set -e
+          mkdir -p /tmp/sdl-headers/include
+          git clone --depth 1 --branch release-1.2.15 https://github.com/libsdl-org/SDL-1.2.git /tmp/SDL-1.2
+          cp /tmp/SDL-1.2/include/*.h /tmp/sdl-headers/include/
+          cp /tmp/SDL-1.2/include/SDL_config_win32.h /tmp/sdl-headers/include/SDL_config.h
+
+          git clone --depth 1 --branch release-1.2.12 https://github.com/libsdl-org/SDL_mixer.git /tmp/SDL_mixer
+          cp /tmp/SDL_mixer/SDL_mixer.h /tmp/sdl-headers/include/
+
+          git clone --depth 1 --branch release-1.2.8 https://github.com/libsdl-org/SDL_net.git /tmp/SDL_net
+          cp /tmp/SDL_net/SDL_net.h /tmp/sdl-headers/include/
 
       - name: Checkout Chocolate Doom 1.3.0
         uses: actions/checkout@v4
@@ -126,16 +150,20 @@ jobs:
           path: chocolate-doom
 
       - name: Aplicar patch de touch controls
-        run: |
-          cd chocolate-doom
-          git apply ../repo/touch-controls-medianav.patch
+        working-directory: chocolate-doom
+        run: git apply ../repo/touch-controls-medianav.patch
 
       - name: Configurar (cross-build autotools p/ WinCE ARM)
         working-directory: chocolate-doom
         env:
-          SDL_CONFIG: ${{ env.SYSROOT }}/bin/sdl-config
-          CPPFLAGS: -I${{ env.SYSROOT }}/include -I${{ steps.toolchain-paths.outputs.include_dir }}
-          LDFLAGS: -L${{ env.SYSROOT }}/lib -L${{ steps.toolchain-paths.outputs.lib_dir }}
+          CPPFLAGS: -I/tmp/sdl-headers/include -I${{ steps.tc.outputs.include_dir }}
+          LDFLAGS: -L${{ steps.implibs.outputs.implib_dir }} -L${{ steps.tc.outputs.lib_dir }}
+          LIBS: -lSDL -lSDL_mixer -lSDL_net
+          # Sem sdl-config de verdade (não compilamos o SDL, reaproveitamos
+          # as DLLs prontas) - fornece os flags manualmente pro configure
+          # não tentar rodar um sdl-config que não existe.
+          SDL_CFLAGS: -I/tmp/sdl-headers/include
+          SDL_LIBS: -lSDL
         run: |
           ./autogen.sh
           ./configure \
@@ -147,17 +175,19 @@ jobs:
         working-directory: chocolate-doom
         run: make -j"$(nproc)"
 
-      - name: Upload dos binários .exe (ARM WinCE)
+      - name: Upload dos binários (.exe + .dll originais pra copiar junto)
         uses: actions/upload-artifact@v4
         with:
           name: chocolate-doom-medianav-arm
           path: |
             chocolate-doom/src/*.exe
-            ${{ env.SYSROOT }}/bin/*.dll
+            /tmp/cab-extracted/SDL.dll
+            /tmp/cab-extracted/SDL_mixer.dll
+            /tmp/cab-extracted/libSDL_net-1-2-0.dll
           if-no-files-found: warn
 
   # Empacotamento em .cab: as ferramentas oficiais da Microsoft (cabwiz)
   # só rodam no Windows. Pra instalar no MediaNav, o caminho mais simples
-  # é pegar os artifacts (.exe + .dll da SDL) e copiar via USB/cartão pra
-  # dentro do WinCE, tipo o README do Morkin23/doom-arm-ce mostra - sem
-  # precisar de instalador de verdade.
+  # é pegar os artifacts (.exe novo com o patch de touch + as 3 .dll
+  # originais) e copiar via USB/cartão direto pro WinCE, do jeito que o
+  # README do Morkin23/doom-arm-ce já descreve pro chocolate-doom.exe antigo.
