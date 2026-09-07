@@ -1,0 +1,343 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 378ad05..f886e54 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -55,6 +55,7 @@ i_scale.c            i_scale.h             \
+ i_system.c           i_system.h            \
+ i_timer.c            i_timer.h             \
+ i_video.c            i_video.h             \
++i_wince_touch.c      i_wince_touch.h       \
+ m_argv.c             m_argv.h              \
+ m_bbox.c             m_bbox.h              \
+ m_cheat.c            m_cheat.h             \
+diff --git a/src/i_video.c b/src/i_video.c
+index 6936532..938ee92 100644
+--- a/src/i_video.c
++++ b/src/i_video.c
+@@ -32,6 +32,10 @@
+ 
+ #include "icon.c"
+ 
++#ifdef _WIN32_WCE
++#include "i_wince_touch.h"
++#endif
++
+ #include "config.h"
+ #include "deh_main.h"
+ #include "doomdef.h"
+@@ -544,6 +548,29 @@ void I_GetEvent(void)
+                 break;
+                 */
+ 
++#ifdef _WIN32_WCE
++            // On WinCE the digitizer (resistive touchscreen) is reported
++            // by SDL's GAPI video driver as ordinary mouse events. We hijack
++            // those here to drive an on-screen D-pad/fire/use overlay
++            // instead of Chocolate Doom's normal "click to fire" handling.
++            case SDL_MOUSEMOTION:
++                // screen->w/h is the physical panel resolution; screens[0]
++                // (and the overlay zones) are always logical SCREENWIDTH x
++                // SCREENHEIGHT, so rescale the raw touch point into that
++                // logical space before hit-testing against it.
++                I_WinCETouch_Motion(sdlevent.motion.x * SCREENWIDTH / screen->w,
++                                     sdlevent.motion.y * SCREENHEIGHT / screen->h);
++                break;
++
++            case SDL_MOUSEBUTTONDOWN:
++                I_WinCETouch_Down(sdlevent.button.x * SCREENWIDTH / screen->w,
++                                   sdlevent.button.y * SCREENHEIGHT / screen->h);
++                break;
++
++            case SDL_MOUSEBUTTONUP:
++                I_WinCETouch_Up();
++                break;
++#else
+             case SDL_MOUSEBUTTONDOWN:
+ 		if (usemouse && !nomouse)
+ 		{
+@@ -563,6 +590,7 @@ void I_GetEvent(void)
+                     D_PostEvent(&event);
+ 		}
+                 break;
++#endif
+ 
+             case SDL_QUIT:
+                 // bring up the "quit doom?" prompt
+@@ -847,6 +875,12 @@ void I_FinishUpdate (void)
+     
+     }
+ 
++#ifdef _WIN32_WCE
++    // Draw the touch D-pad / fire / use button outlines directly into
++    // the indexed framebuffer before it gets blitted to the real screen.
++    I_WinCETouch_DrawOverlay(screens[0], SCREENWIDTH, SCREENHEIGHT);
++#endif
++
+     // draw to screen
+ 
+     BlitArea(0, 0, SCREENWIDTH, SCREENHEIGHT);
+diff --git a/src/i_wince_touch.c b/src/i_wince_touch.c
+new file mode 100644
+index 0000000..65aee47
+--- /dev/null
++++ b/src/i_wince_touch.c
+@@ -0,0 +1,234 @@
++// i_wince_touch.c
++//
++// On-screen touch controls for Windows CE (MediaNav Evolution 5.2.7).
++//
++// Layout (in logical SCREENWIDTH x SCREENHEIGHT space, i.e. 320x200):
++//
++//   +----------------------------------------------+
++//   |                   gameplay                    |
++//   |                                                |
++//   |  [<] [^]   [>]                    [USE]  [FIRE]|
++//   |      [v]                                       |
++//   +----------------------------------------------+
++//
++// Only one finger at a time is supported by the digitizer, so we only
++// ever track a single "currently held" zone.
++
++#include "doomdef.h"
++#include "doomkeys.h"
++#include "d_event.h"
++#include "d_main.h"
++#include "i_wince_touch.h"
++
++// Key bindings used by g_game.c / m_config.c. We post synthetic key
++// events using these so rebinding controls in the options menu also
++// changes what the touch buttons do.
++extern int key_up;
++extern int key_down;
++extern int key_left;
++extern int key_right;
++extern int key_fire;
++extern int key_use;
++
++typedef enum
++{
++    TOUCH_ZONE_NONE,
++    TOUCH_ZONE_LEFT,
++    TOUCH_ZONE_UP,
++    TOUCH_ZONE_RIGHT,
++    TOUCH_ZONE_DOWN,
++    TOUCH_ZONE_USE,
++    TOUCH_ZONE_FIRE,
++    TOUCH_ZONE_COUNT
++} touch_zone_t;
++
++typedef struct
++{
++    int x1, y1, x2, y2;
++    int key;
++} touch_button_t;
++
++// Populated by I_WinCETouch_InitLayout() the first time it's needed,
++// since it depends on SCREENWIDTH/SCREENHEIGHT constants.
++static touch_button_t buttons[TOUCH_ZONE_COUNT];
++static boolean layout_ready = false;
++
++// Which zone (if any) is currently held down.
++static touch_zone_t active_zone = TOUCH_ZONE_NONE;
++
++// Roughly a 40x40 (logical pixel) button on a 320x200 canvas - big
++// enough for a thumb on a 7" resistive panel without covering too much
++// of the play area.
++#define BTN_SIZE   40
++#define BTN_MARGIN 4
++
++static void InitLayout(void)
++{
++    int bottom = SCREENHEIGHT - BTN_MARGIN - BTN_SIZE;
++    int i;
++
++    // Movement cluster, bottom-left.
++    buttons[TOUCH_ZONE_LEFT].x1  = BTN_MARGIN;
++    buttons[TOUCH_ZONE_LEFT].y1  = bottom;
++    buttons[TOUCH_ZONE_LEFT].key = key_left;
++
++    buttons[TOUCH_ZONE_UP].x1  = BTN_MARGIN + BTN_SIZE + BTN_MARGIN;
++    buttons[TOUCH_ZONE_UP].y1  = bottom - BTN_SIZE - BTN_MARGIN;
++    buttons[TOUCH_ZONE_UP].key = key_up;
++
++    buttons[TOUCH_ZONE_RIGHT].x1  = BTN_MARGIN + 2 * (BTN_SIZE + BTN_MARGIN);
++    buttons[TOUCH_ZONE_RIGHT].y1  = bottom;
++    buttons[TOUCH_ZONE_RIGHT].key = key_right;
++
++    buttons[TOUCH_ZONE_DOWN].x1  = BTN_MARGIN + BTN_SIZE + BTN_MARGIN;
++    buttons[TOUCH_ZONE_DOWN].y1  = bottom;
++    buttons[TOUCH_ZONE_DOWN].key = key_down;
++
++    // Action cluster, bottom-right.
++    buttons[TOUCH_ZONE_FIRE].x1  = SCREENWIDTH - BTN_MARGIN - BTN_SIZE;
++    buttons[TOUCH_ZONE_FIRE].y1  = bottom;
++    buttons[TOUCH_ZONE_FIRE].key = key_fire;
++
++    buttons[TOUCH_ZONE_USE].x1  = SCREENWIDTH - 2 * BTN_MARGIN - 2 * BTN_SIZE;
++    buttons[TOUCH_ZONE_USE].y1  = bottom;
++    buttons[TOUCH_ZONE_USE].key = key_use;
++
++    for (i = TOUCH_ZONE_LEFT; i < TOUCH_ZONE_COUNT; i++)
++    {
++        buttons[i].x2 = buttons[i].x1 + BTN_SIZE;
++        buttons[i].y2 = buttons[i].y1 + BTN_SIZE;
++    }
++
++    layout_ready = true;
++}
++
++static touch_zone_t HitTest(int x, int y)
++{
++    int i;
++
++    if (!layout_ready)
++    {
++        InitLayout();
++    }
++
++    for (i = TOUCH_ZONE_LEFT; i < TOUCH_ZONE_COUNT; i++)
++    {
++        if (x >= buttons[i].x1 && x < buttons[i].x2
++         && y >= buttons[i].y1 && y < buttons[i].y2)
++        {
++            return (touch_zone_t) i;
++        }
++    }
++
++    return TOUCH_ZONE_NONE;
++}
++
++static void PostKey(int key, boolean down)
++{
++    event_t event;
++
++    if (key == 0)
++    {
++        return;
++    }
++
++    event.type = down ? ev_keydown : ev_keyup;
++    event.data1 = key;
++    event.data2 = key;
++    D_PostEvent(&event);
++}
++
++void I_WinCETouch_Down(int x, int y)
++{
++    touch_zone_t zone = HitTest(x, y);
++
++    if (zone == TOUCH_ZONE_NONE)
++    {
++        return;
++    }
++
++    active_zone = zone;
++    PostKey(buttons[zone].key, true);
++}
++
++void I_WinCETouch_Motion(int x, int y)
++{
++    touch_zone_t zone;
++
++    // Only matters while a finger is already down - lets the player
++    // slide from one button to another (e.g. left -> up) without
++    // lifting off, same as most touch D-pads.
++    if (active_zone == TOUCH_ZONE_NONE)
++    {
++        return;
++    }
++
++    zone = HitTest(x, y);
++
++    if (zone == active_zone)
++    {
++        return;
++    }
++
++    PostKey(buttons[active_zone].key, false);
++
++    if (zone != TOUCH_ZONE_NONE)
++    {
++        PostKey(buttons[zone].key, true);
++    }
++
++    active_zone = zone;
++}
++
++void I_WinCETouch_Up(void)
++{
++    if (active_zone == TOUCH_ZONE_NONE)
++    {
++        return;
++    }
++
++    PostKey(buttons[active_zone].key, false);
++    active_zone = TOUCH_ZONE_NONE;
++}
++
++// Draws a plain rectangular outline for each button directly into the
++// indexed framebuffer, using a palette index that reads as bright white
++// in the Doom playpal (0x04 is close to it and cheap to pick without
++// pulling in the palette lookup code - tweak if it looks wrong on
++// target hardware).
++#define OVERLAY_COLOR 0x04
++
++static void DrawRect(unsigned char *buf, int width, int height,
++                      int x1, int y1, int x2, int y2)
++{
++    int x, y;
++
++    for (x = x1; x < x2; x++)
++    {
++        if (y1 >= 0 && y1 < height) buf[y1 * width + x] = OVERLAY_COLOR;
++        if (y2 - 1 >= 0 && y2 - 1 < height) buf[(y2 - 1) * width + x] = OVERLAY_COLOR;
++    }
++
++    for (y = y1; y < y2; y++)
++    {
++        if (x1 >= 0 && x1 < width) buf[y * width + x1] = OVERLAY_COLOR;
++        if (x2 - 1 >= 0 && x2 - 1 < width) buf[y * width + x2 - 1] = OVERLAY_COLOR;
++    }
++}
++
++void I_WinCETouch_DrawOverlay(unsigned char *screenbuf, int width, int height)
++{
++    int i;
++
++    if (!layout_ready)
++    {
++        InitLayout();
++    }
++
++    for (i = TOUCH_ZONE_LEFT; i < TOUCH_ZONE_COUNT; i++)
++    {
++        DrawRect(screenbuf, width, height,
++                 buttons[i].x1, buttons[i].y1,
++                 buttons[i].x2, buttons[i].y2);
++    }
++}
+diff --git a/src/i_wince_touch.h b/src/i_wince_touch.h
+new file mode 100644
+index 0000000..639e5bd
+--- /dev/null
++++ b/src/i_wince_touch.h
+@@ -0,0 +1,19 @@
++// i_wince_touch.h
++//
++// On-screen touch D-pad / fire / use overlay for Windows CE builds
++// (written for the MediaNav Evolution 5.2.7 headunit, resistive
++// touchscreen reported by SDL's GAPI driver as ordinary mouse events).
++//
++// This is intentionally minimal: six fixed zones drawn over the game
++// framebuffer (forward, back, turn left, turn right, fire, use).
++// No pinch/multitouch - the digitizer is single-touch anyway.
++
++#ifndef __I_WINCE_TOUCH_H__
++#define __I_WINCE_TOUCH_H__
++
++void I_WinCETouch_Down(int x, int y);
++void I_WinCETouch_Motion(int x, int y);
++void I_WinCETouch_Up(void);
++void I_WinCETouch_DrawOverlay(unsigned char *screenbuf, int width, int height);
++
++#endif
